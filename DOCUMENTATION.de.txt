@@ -8,17 +8,18 @@ Projektstruktur seit 0.51.18:
 - `build.zig.zon` bindet `r4os_sdk` als Paket.
 - `module.R4MF` beschreibt Artefakt, Zielpfad und Contract.
 
-Build:
+Build aus dem Repository `Repositories/Apps/ServiceManager`:
 
-    cd Code\System\Software\ServiceManager
-    ..\..\..\DevTools\Zig\zig.exe build
+    Windows: Build.bat
+    Linux:   ./Build.sh
 
-Ergebnis:
+Die Starter loesen Toolchain und lokale SDK-Abhaengigkeiten ueber
+`Settings.R4S` auf. Das Ergebnis liegt im Repository unter:
 
-    Code\System\Software\ServiceManager\zig-out\SERVMAN.R4X
+    zig-out/SERVMAN.R4X
 
 Contract:
-- R4XStart-Entry: `servman_main`
+- App-Einstieg: `r4_app_main`; `ENTRY_MODE=app` erzeugt den SDK-Startwrapper.
 - App-Klasse: `console`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\TERMINAL\SERVMAN.R4X`
 
