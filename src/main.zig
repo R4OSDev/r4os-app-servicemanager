@@ -43,13 +43,11 @@ fn run(sys: *r4os.r4sys.Context, args: []const u8) i32 {
     }
 
     if (args.len == 0) {
-        printList(sys);
-        return 0;
+        return printList(sys);
     }
 
     const first = takeToken(args) orelse {
-        printList(sys);
-        return 0;
+        return printList(sys);
     };
 
     if (tokenEquals(first.token, "/?") or tokenEquals(first.token, "HELP")) {
@@ -57,8 +55,7 @@ fn run(sys: *r4os.r4sys.Context, args: []const u8) i32 {
         return 0;
     }
     if (tokenEquals(first.token, "LIST")) {
-        printList(sys);
-        return 0;
+        return printList(sys);
     }
     if (tokenEquals(first.token, "LOAD")) return loadConfigCommand(sys, false);
     if (tokenEquals(first.token, "BOOT")) return bootCommand(sys);
@@ -111,11 +108,9 @@ fn printDiag(sys: *r4os.r4sys.Context) i32 {
     var busy_rejections: u64 = 0;
     var timeouts: u64 = 0;
     var cancellations: u64 = 0;
-    var index: u32 = 0;
-    while (true) : (index += 1) {
-        var detail: r4os.abi.ServiceDetail = .{};
-        const rc = sys.serviceDetail(index, &detail);
-        if (rc <= 0) break;
+    var staging: [16]r4os.abi.ServiceDetail = undefined;
+    const total = readDetails(sys, &staging) orelse return 1;
+    for (staging[0..total]) |detail| {
         count += 1;
         switch (detail.info.start_mode) {
             r4os.abi.service_start_auto => auto_count += 1,
@@ -387,7 +382,7 @@ fn saveConfigCommand(sys: *r4os.r4sys.Context) i32 {
 fn dumpConfigCommand(sys: *r4os.r4sys.Context) i32 {
     var out: [config_max]u8 = undefined;
     const len = writeConfig(sys, out[0..]) orelse {
-        sys.println("SERVMAN CONFIG: config buffer too small.");
+        sys.println("SERVMAN CONFIG: complete configuration unavailable or buffer too small.");
         return 1;
     };
     const visible = stripBom(out[0..len]);
@@ -399,7 +394,7 @@ fn dumpConfigCommand(sys: *r4os.r4sys.Context) i32 {
 fn saveConfig(sys: *r4os.r4sys.Context, verbose: bool) bool {
     var out: [config_max]u8 = undefined;
     const len = writeConfig(sys, out[0..]) orelse {
-        if (verbose) sys.println("SERVMAN SAVE: config buffer too small.");
+        if (verbose) sys.println("SERVMAN SAVE: complete configuration unavailable or buffer too small.");
         return false;
     };
     const written = sys.fileWrite(config_path, out[0..len]);
@@ -520,15 +515,24 @@ fn parseConfigLine(sys: *r4os.r4sys.Context, line_raw: []const u8, report: *Conf
     }
 }
 
+fn readDetails(sys: *r4os.r4sys.Context, staging: []r4os.abi.ServiceDetail) ?usize {
+    return switch (r4os.app_services.readCompleteDetails(sys, staging)) {
+        .complete => |count| count,
+        .failure => |rc| {
+            sys.write("SERVMAN: service enumeration failed: ");
+            sys.println(resultName(rc));
+            return null;
+        },
+    };
+}
+
 fn writeConfig(sys: *r4os.r4sys.Context, out: []u8) ?usize {
     var pos: usize = 0;
     if (!append(out, &pos, "\xEF\xBB\xBF# R4OS SERVICES.R4S\r\n")) return null;
     if (!append(out, &pos, "# Managed by SERVMAN.R4X\r\n")) return null;
-    var index: u32 = 0;
-    while (true) : (index += 1) {
-        var detail: r4os.abi.ServiceDetail = .{};
-        const rc = sys.serviceDetail(index, &detail);
-        if (rc <= 0) break;
+    var staging: [16]r4os.abi.ServiceDetail = undefined;
+    const count = readDetails(sys, &staging) orelse return null;
+    for (staging[0..count]) |detail| {
         if (!append(out, &pos, "SERVICE;name=")) return null;
         if (!append(out, &pos, spanZ(detail.info.name[0..]))) return null;
         if (!append(out, &pos, ";path=")) return null;
@@ -569,14 +573,12 @@ fn printConfigReport(sys: *r4os.r4sys.Context, label: []const u8, report: *const
 }
 
 fn startAutoServices(sys: *r4os.r4sys.Context) i32 {
-    var index: u32 = 0;
     var attempted: u32 = 0;
     var started: u32 = 0;
     var failed: u32 = 0;
-    while (true) : (index += 1) {
-        var detail: r4os.abi.ServiceDetail = .{};
-        const rc = sys.serviceDetail(index, &detail);
-        if (rc <= 0) break;
+    var staging: [16]r4os.abi.ServiceDetail = undefined;
+    const total = readDetails(sys, &staging) orelse return 1;
+    for (staging[0..total]) |detail| {
         if (detail.info.start_mode != r4os.abi.service_start_auto) continue;
 
         attempted += 1;
@@ -601,18 +603,13 @@ fn startAutoServices(sys: *r4os.r4sys.Context) i32 {
     return 0;
 }
 
-fn printList(sys: *r4os.r4sys.Context) void {
+fn printList(sys: *r4os.r4sys.Context) i32 {
+    var staging: [16]r4os.abi.ServiceDetail = undefined;
+    const count = readDetails(sys, &staging) orelse return 1;
     sys.println("SERVMAN Services");
-    var index: u32 = 0;
-    var shown: u32 = 0;
-    while (true) : (index += 1) {
-        var detail: r4os.abi.ServiceDetail = .{};
-        const rc = sys.serviceDetail(index, &detail);
-        if (rc <= 0) break;
-        shown += 1;
-        printServiceLine(sys, &detail);
-    }
-    if (shown == 0) sys.println("  No registered services.");
+    for (staging[0..count]) |*detail| printServiceLine(sys, detail);
+    if (count == 0) sys.println("  No registered services.");
+    return 0;
 }
 
 fn printServiceLine(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDetail) void {
