@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.5`
 - Image target: `/R4OS/SOFTWARE/TERMINAL/SERVMAN.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -18,7 +18,7 @@ On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
@@ -26,6 +26,10 @@ The build starters resolve the current local R4OS dependency checkouts through
 `Settings.R4S`. The URL and hash entries in `build.zig.zon` record the
 last verified standalone dependency identities; workspace builds use the
 mapped local checkouts.
+
+The workspace artifact is `Artifacts/Modules/ServiceManager/SERVMAN.R4X`.
+`STATUS` uses the generation-bound service snapshot from SDK 0.64.118 /
+R4SYS 34. Memory details use that exact process handle.
 
 ## Documentation
 

@@ -14,9 +14,9 @@ Build aus dem Repository `Repositories/Apps/ServiceManager`:
     Linux:   ./Build.sh
 
 Die Starter loesen Toolchain und lokale SDK-Abhaengigkeiten ueber
-`Settings.R4S` auf. Das Ergebnis liegt im Repository unter:
+`Settings.R4S` auf. Das Distributionsartefakt liegt im Workspace unter:
 
-    zig-out/SERVMAN.R4X
+    Artifacts/Modules/ServiceManager/SERVMAN.R4X
 
 Contract:
 - App-Einstieg: `r4_app_main`; `ENTRY_MODE=app` erzeugt den SDK-Startwrapper.
@@ -39,3 +39,9 @@ Seit 0.55.7 zeigt `SERVMAN DIAG` zusaetzlich die Connectivity-Endpoints
 auch `FTPSVC` in dieser Uebersicht enthalten. Sichtbar sind
 Endpoint-Status, Queue-Status, Worker, offene Handles, Busy-/Timeout-/Cancel-
 Zaehler und der letzte Fehlercode.
+
+Seit 0.88.70 verwendet STATUS mit SDK 0.64.118 / R4SYS 34 den gebundenen
+Dienstsnapshot aus service_bound_detail. Dienstinformationen und voller
+Prozesshandle gehoeren damit zu derselben Generation; die Memoryabfrage
+verwendet genau diesen Handle. Die bisherige Suche im gesamten
+Prozessinventar nach einer blossen Instanz-ID entfaellt.

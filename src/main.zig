@@ -251,12 +251,13 @@ fn commandStatus(sys: *r4os.r4sys.Context, rest: []const u8) i32 {
     var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
     const name_ptr = makeZ(name_z[0..], part.token) orelse return fail(sys, "name-too-long");
     var detail: r4os.abi.ServiceDetail = .{};
-    const rc = sys.serviceDetailByName(name_ptr, &detail);
+    var process: r4os.abi.ProgramProcessHandle = .{};
+    const rc = sys.serviceBoundDetail(name_ptr, &detail, &process);
     if (rc != r4os.abi.service_api_result_ok) {
         printCommandResult(sys, "STATUS", part.token, rc);
         return 1;
     }
-    printServiceDetail(sys, &detail);
+    printServiceDetail(sys, &detail, &process);
     printEndpointStatus(sys, name_ptr);
     return 0;
 }
@@ -632,7 +633,7 @@ fn printServiceLine(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDet
     sys.println("");
 }
 
-fn printServiceDetail(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDetail) void {
+fn printServiceDetail(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDetail, process: *const r4os.abi.ProgramProcessHandle) void {
     sys.write("Name: ");
     sys.println(spanZ(detail.info.name[0..]));
     sys.write("Status: ");
@@ -642,8 +643,9 @@ fn printServiceDetail(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceD
     sys.write("Instance: ");
     writeUnsigned(sys, detail.info.instance_id);
     sys.println("");
-    if (detail.info.instance_id != 0 and sys.base.hasDevFn("memory_summary")) {
-        if (programInstanceById(sys, detail.info.instance_id)) |instance| {
+    if (detail.info.instance_id != 0 and process.instance_id == detail.info.instance_id and sys.base.hasDevFn("memory_summary")) {
+        var instance: r4os.abi.ProgramInstanceInfo = .{};
+        if (sys.programHandleStatus(process, &instance) == 0) {
             sys.write("Memory: ");
             sys.write(memoryProfileName(instance.memory_profile));
             sys.write(" reserveMB=");
@@ -690,15 +692,6 @@ fn printServiceDetail(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceD
         sys.write(" cancel=");
         writeUnsigned(sys, detail.info.cancellations);
         sys.println("");
-    }
-}
-
-fn programInstanceById(sys: *r4os.r4sys.Context, id: u32) ?r4os.abi.ProgramInstanceInfo {
-    var index: u32 = 0;
-    while (true) : (index += 1) {
-        var info: r4os.abi.ProgramInstanceInfo = .{};
-        if (sys.programInstance(index, &info) <= 0) return null;
-        if (info.id == id) return info;
     }
 }
 
