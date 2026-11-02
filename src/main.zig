@@ -1,7 +1,9 @@
 const r4os = @import("r4os");
+const std = @import("std");
+const checks = r4os.system_update_recovery;
 
 const config_path = "C:\\R4OS\\CONFIG\\SERVICES.R4S";
-const config_max: usize = 4096;
+const service_path_capacity = @sizeOf(@FieldType(r4os.abi.ServiceInventoryRow, "path"));
 const endpoint_status_op: u16 = 1;
 const endpoint_status_timeout_ms: u64 = 5000;
 const endpoint_status_attempts: u32 = 3;
@@ -29,11 +31,11 @@ const Action = enum(u8) {
 
 const ConfigReport = struct {
     missing: bool = false,
-    lines: u32 = 0,
-    loaded: u32 = 0,
-    duplicate: u32 = 0,
-    invalid: u32 = 0,
-    too_large: bool = false,
+    lines: u64 = 0,
+    loaded: u64 = 0,
+    duplicate: u64 = 0,
+    invalid: u64 = 0,
+    error_code: i32 = 0,
 };
 
 fn run(sys: *r4os.r4sys.Context, args: []const u8) i32 {
@@ -108,9 +110,9 @@ fn printDiag(sys: *r4os.r4sys.Context) i32 {
     var busy_rejections: u64 = 0;
     var timeouts: u64 = 0;
     var cancellations: u64 = 0;
-    var staging: [16]r4os.abi.ServiceDetail = undefined;
-    const total = readDetails(sys, &staging) orelse return 1;
-    for (staging[0..total]) |detail| {
+    var inventory = readInventory(sys) orelse return 1;
+    defer inventory.deinit();
+    for (inventory.rows) |detail| {
         count += 1;
         switch (detail.info.start_mode) {
             r4os.abi.service_start_auto => auto_count += 1,
@@ -239,6 +241,34 @@ fn selfTest(sys: *r4os.r4sys.Context) i32 {
     var report: ConfigReport = .{};
     parseConfig(sys, out[0..pos], &report, true);
     if (report.lines != 1 or report.invalid != 0) return fail(sys, "parse");
+    const rows = sys.allocator().alloc(r4os.abi.ServiceInventoryRow, 300) catch return fail(sys, "selftest-memory");
+    defer sys.allocator().free(rows);
+    for (rows, 0..) |*row, index| {
+        row.* = .{};
+        const name = std.fmt.bufPrint(&row.info.name, "T{d:0>4}", .{index}) catch return fail(sys, "test-name");
+        row.info.name[name.len] = 0;
+        row.info.start_mode = switch (index % 3) {
+            0 => r4os.abi.service_start_auto,
+            1 => r4os.abi.service_start_manual,
+            else => r4os.abi.service_start_disabled,
+        };
+        @memset(row.path[0..200], 'A');
+        @memcpy(row.path[0..3], "C:\\");
+        setZ(&row.description, "Größe UTF-8");
+    }
+    const rendered = renderConfig(sys.allocator(), rows) catch return fail(sys, "test-render");
+    defer sys.allocator().free(rendered);
+    if (rendered.len <= 4096 or !std.mem.startsWith(u8, rendered, "\xEF\xBB\xBF")) return fail(sys, "large-config");
+    var large: ConfigReport = .{};
+    parseConfig(sys, rendered, &large, true);
+    if (large.lines != 300 or large.invalid != 0) return fail(sys, "large-roundtrip");
+    var tiny: [1]u8 = undefined;
+    var failing = std.heap.FixedBufferAllocator.init(&tiny);
+    if (renderConfig(failing.allocator(), rows)) |unexpected| {
+        failing.allocator().free(unexpected);
+        return fail(sys, "oom-success");
+    } else |err| if (err != error.OutOfMemory) return fail(sys, "oom-code");
+    sys.println("SERVMAN large-config: 300 rows, full paths, Unicode, OOM: OK");
     sys.println("SERVMAN selftest: OK");
     return 0;
 }
@@ -250,14 +280,13 @@ fn commandStatus(sys: *r4os.r4sys.Context, rest: []const u8) i32 {
     };
     var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
     const name_ptr = makeZ(name_z[0..], part.token) orelse return fail(sys, "name-too-long");
-    var detail: r4os.abi.ServiceDetail = .{};
-    var process: r4os.abi.ProgramProcessHandle = .{};
-    const rc = sys.serviceBoundDetail(name_ptr, &detail, &process);
-    if (rc != r4os.abi.service_api_result_ok) {
-        printCommandResult(sys, "STATUS", part.token, rc);
+    var inventory = readInventory(sys) orelse return 1;
+    defer inventory.deinit();
+    const detail = findRow(inventory.rows, part.token) orelse {
+        printCommandResult(sys, "STATUS", part.token, r4os.abi.service_api_result_not_found);
         return 1;
-    }
-    printServiceDetail(sys, &detail, &process);
+    };
+    printServiceDetail(sys, detail, &detail.process);
     printEndpointStatus(sys, name_ptr);
     return 0;
 }
@@ -267,18 +296,13 @@ fn commandOne(sys: *r4os.r4sys.Context, rest: []const u8, action: Action) i32 {
         printUsage(sys);
         return 1;
     };
-    var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-    const name_ptr = makeZ(name_z[0..], part.token) orelse return fail(sys, "name-too-long");
-    var info: r4os.abi.ServiceInfo = .{};
-    const rc = switch (action) {
-        .start => sys.serviceStart(name_ptr, &info),
-        .stop => sys.serviceStop(name_ptr, &info, 40),
-        .restart => sys.serviceRestart(name_ptr, &info),
-        .manual => sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_manual, &info),
-        .auto => sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_auto, &info),
-        .disable => sys.serviceSetStartMode(name_ptr, r4os.abi.service_start_disabled, &info),
-        .remove => sys.serviceRemove(name_ptr),
+    var inventory = readInventory(sys) orelse return 1;
+    defer inventory.deinit();
+    const row = findRow(inventory.rows, part.token) orelse {
+        printCommandResult(sys, actionName(action), part.token, r4os.abi.service_api_result_not_found);
+        return 1;
     };
+    const rc = controlRow(sys, row, action);
     printCommandResult(sys, actionName(action), part.token, rc);
     if (rc == r4os.abi.service_api_result_self_restart) {
         // Say what to do instead, so the refusal is actionable rather than
@@ -322,7 +346,7 @@ fn commandInstall(sys: *r4os.r4sys.Context, rest_raw: []const u8) i32 {
     }
 
     var name_z: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-    var path_z: [r4os.abi.service_path_bytes + 1]u8 = .{0} ** (r4os.abi.service_path_bytes + 1);
+    var path_z: [service_path_capacity]u8 = .{0} ** service_path_capacity;
     var args_z: [r4os.abi.service_args_bytes + 1]u8 = .{0} ** (r4os.abi.service_args_bytes + 1);
     var desc_z: [r4os.abi.service_description_bytes + 1]u8 = .{0} ** (r4os.abi.service_description_bytes + 1);
     const name_ptr = makeZ(name_z[0..], name_part.token) orelse return fail(sys, "name-too-long");
@@ -344,36 +368,35 @@ fn loadConfigCommand(sys: *r4os.r4sys.Context, missing_ok: bool) i32 {
 fn bootCommand(sys: *r4os.r4sys.Context) i32 {
     var report: ConfigReport = .{};
     const load_rc = loadConfig(sys, true, "BOOT", &report);
-    if (load_rc != 0 and (report.too_large or (report.loaded == 0 and report.duplicate == 0))) return load_rc;
+    if (load_rc != 0 and (report.error_code != 0 or (report.loaded == 0 and report.duplicate == 0))) return load_rc;
     return startAutoServices(sys);
 }
 
 fn loadConfig(sys: *r4os.r4sys.Context, missing_ok: bool, label: []const u8, report: *ConfigReport) i32 {
-    var buf: [config_max]u8 = undefined;
-    const read = sys.fileRead(config_path, buf[0..]);
-    if (read < 0) {
-        report.missing = true;
-        if (missing_ok) {
+    const bytes = readFileBytes(sys, config_path) catch |err| {
+        report.missing = err == error.NotFound;
+        if (report.missing and missing_ok) {
             printConfigReport(sys, label, report);
             return 0;
         }
+        report.error_code = if (err == error.OutOfMemory) r4os.abi.service_api_result_memory else r4os.abi.service_api_result_config_io;
         sys.write("SERVMAN ");
         sys.write(label);
-        sys.write(": ");
-        sys.write(config_path);
-        sys.println(" is not readable or missing.");
+        sys.write(": config read failed: ");
+        sys.println(@errorName(err));
+        return 1;
+    };
+    defer sys.allocator().free(bytes);
+    var validation: ConfigReport = .{};
+    parseConfig(sys, bytes, &validation, true);
+    if (validation.invalid != 0) {
+        report.* = validation;
+        printConfigReport(sys, label, report);
         return 1;
     }
-    const len: usize = @intCast(read);
-    if (len > buf.len) {
-        sys.write("SERVMAN ");
-        sys.write(label);
-        sys.println(": SERVICES.R4S too large.");
-        return 1;
-    }
-    parseConfig(sys, buf[0..len], report, false);
+    parseConfig(sys, bytes, report, false);
     printConfigReport(sys, label, report);
-    return if (report.invalid == 0 and !report.too_large) 0 else 1;
+    return if (report.invalid == 0 and report.error_code == 0) 0 else 1;
 }
 
 fn saveConfigCommand(sys: *r4os.r4sys.Context) i32 {
@@ -381,34 +404,152 @@ fn saveConfigCommand(sys: *r4os.r4sys.Context) i32 {
 }
 
 fn dumpConfigCommand(sys: *r4os.r4sys.Context) i32 {
-    var out: [config_max]u8 = undefined;
-    const len = writeConfig(sys, out[0..]) orelse {
-        sys.println("SERVMAN CONFIG: complete configuration unavailable or buffer too small.");
-        return 1;
-    };
-    const visible = stripBom(out[0..len]);
-    sys.write(visible);
+    var inventory = readInventory(sys) orelse return 1;
+    defer inventory.deinit();
+    const out = renderConfig(sys.allocator(), inventory.rows) catch return fail(sys, "config-memory");
+    defer sys.allocator().free(out);
+    const visible = stripBom(out);
+    var offset: usize = 0;
+    while (offset < visible.len) {
+        const end = offset + @min(visible.len - offset, 16384);
+        sys.write(visible[offset..end]);
+        offset = end;
+    }
     if (visible.len == 0 or visible[visible.len - 1] != '\n') sys.println("");
     return 0;
 }
 
 fn saveConfig(sys: *r4os.r4sys.Context, verbose: bool) bool {
-    var out: [config_max]u8 = undefined;
-    const len = writeConfig(sys, out[0..]) orelse {
-        if (verbose) sys.println("SERVMAN SAVE: complete configuration unavailable or buffer too small.");
+    var inventory = readInventory(sys) orelse return false;
+    defer inventory.deinit();
+    const bytes = renderConfig(sys.allocator(), inventory.rows) catch {
+        sys.println("SERVMAN SAVE: memory allocation failed; configuration not written.");
         return false;
     };
-    const written = sys.fileWrite(config_path, out[0..len]);
-    if (written != @as(i32, @intCast(len))) {
-        if (verbose) sys.println("SERVMAN SAVE: SERVICES.R4S could not be written.");
+    defer sys.allocator().free(bytes);
+    const old = fingerprint(sys, config_path) catch {
+        sys.println("SERVMAN SAVE: original configuration could not be verified.");
         return false;
+    };
+    var stage_buffer: [64]u8 = undefined;
+    var backup_buffer: [64]u8 = undefined;
+    const seed: u32 = @truncate(sys.ticks() ^ @intFromPtr(&stage_buffer));
+    const files: r4os.app_storage.Files = .{ .sys = sys.* };
+    for (0..32) |attempt| {
+        const id = (seed +% @as(u32, @intCast(attempt))) & 0xFFFFFF;
+        const stage = std.fmt.bufPrintZ(&stage_buffer, "C:\\R4OS\\CONFIG\\SM{X:0>6}.TMP", .{id}) catch return false;
+        const backup = std.fmt.bufPrintZ(&backup_buffer, "C:\\R4OS\\CONFIG\\SM{X:0>6}.BAK", .{id}) catch return false;
+        var info: r4os.abi.FileInfo = .{};
+        const backup_rc = sys.fileInfoRaw(backup, &info);
+        if (backup_rc > 0) continue;
+        if (backup_rc < 0) return false;
+        var writer = switch (files.streamWriter(.{ .ptr = stage, .len = @intCast(stage.len) }, r4os.abi.file_stream_open_create)) {
+            .writer => |value| value,
+            .failure => |code| {
+                if (code == r4os.abi.file_stream_error_exists) continue;
+                sys.println("SERVMAN SAVE: stage creation failed.");
+                return false;
+            },
+        };
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const end = offset + @min(bytes.len - offset, 16384);
+            if (writer.write(bytes[offset..end]) != .ok) {
+                _ = writer.abort();
+                sys.println("SERVMAN SAVE: stage write failed.");
+                return false;
+            }
+            offset = end;
+        }
+        if (writer.finish() != .ok) {
+            _ = writer.abort();
+            sys.println("SERVMAN SAVE: stage flush failed.");
+            return false;
+        }
+        const staged = fingerprint(sys, stage) catch {
+            sys.println("SERVMAN SAVE: stage verification failed; stage retained.");
+            return false;
+        };
+        if (!staged.exists or staged.size != bytes.len or staged.checksum != checks.checksum(bytes) or !inventoryCurrent(sys, &inventory)) {
+            _ = sys.fileDeleteIfMatch(stage, bytes.len, checks.checksum(bytes));
+            sys.println("SERVMAN SAVE: changed inventory or incomplete stage; configuration not replaced.");
+            return false;
+        }
+        var flags = r4os.r4sys.file_update_atomic_checked_flag_forward;
+        if (old.exists) flags |= r4os.r4sys.file_update_atomic_checked_flag_target_existed | r4os.r4sys.file_update_atomic_checked_flag_old_known;
+        const rc = sys.fileUpdateAtomicChecked(config_path, stage, backup, bytes.len, checks.checksum(bytes), old.size, old.checksum, flags);
+        if (rc != 0) {
+            sys.write("SERVMAN SAVE: atomic replacement not confirmed: ");
+            sys.println(r4os.r4sys.fileUpdateAtomicCheckedResultName(rc));
+            sys.write("  Stage: ");
+            sys.println(stage);
+            sys.write("  Backup: ");
+            sys.println(backup);
+            return false;
+        }
+        if (old.exists and sys.fileDeleteIfMatch(backup, old.size, old.checksum) < 0) {
+            sys.write("SERVMAN SAVE: committed; backup cleanup pending: ");
+            sys.println(backup);
+        }
+        if (verbose) {
+            sys.write("SERVMAN SAVE: ");
+            writeUnsigned(sys, bytes.len);
+            sys.println(" Bytes atomar gespeichert.");
+        }
+        return true;
     }
-    if (verbose) {
-        sys.write("SERVMAN SAVE: ");
-        writeUnsigned(sys, len);
-        sys.println(" Bytes geschrieben.");
+    sys.println("SERVMAN SAVE: temporary paths busy.");
+    return false;
+}
+
+fn readFileBytes(sys: *r4os.r4sys.Context, path: [*:0]const u8) ![]u8 {
+    var info: r4os.abi.FileInfo = .{};
+    const exists = sys.fileInfoRaw(path, &info);
+    if (exists == 0) return error.NotFound;
+    if (exists < 0) return error.Read;
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(sys.allocator());
+    var block: [16384]u8 = undefined;
+    while (true) {
+        const offset = std.math.cast(u32, bytes.items.len) orelse return error.OffsetRange;
+        const raw = sys.fileReadAt(path, offset, &block);
+        if (raw < 0 or raw > block.len) return error.Read;
+        if (raw == 0) break;
+        try bytes.appendSlice(sys.allocator(), block[0..@intCast(raw)]);
     }
-    return true;
+    if (bytes.items.len != info.size) return error.Changed;
+    var current: r4os.abi.FileInfo = .{};
+    if (sys.fileInfoRaw(path, &current) <= 0 or current.size != info.size) return error.Changed;
+    return bytes.toOwnedSlice(sys.allocator());
+}
+
+const Fingerprint = struct { exists: bool = false, size: u64 = 0, checksum: u32 = checks.checksum(&.{}) };
+fn fingerprint(sys: *r4os.r4sys.Context, path: [*:0]const u8) !Fingerprint {
+    var info: r4os.abi.FileInfo = .{};
+    const exists = sys.fileInfoRaw(path, &info);
+    if (exists < 0) return error.Read;
+    if (exists == 0) return .{};
+    var result: Fingerprint = .{ .exists = true };
+    var block: [16384]u8 = undefined;
+    while (true) {
+        const offset = std.math.cast(u32, result.size) orelse return error.OffsetRange;
+        const raw = sys.fileReadAt(path, offset, &block);
+        if (raw < 0 or raw > block.len) return error.Read;
+        if (raw == 0) return result;
+        result.checksum = checks.checksumUpdate(result.checksum, block[0..@intCast(raw)]);
+        result.size += @intCast(raw);
+    }
+}
+
+fn inventoryCurrent(sys: *r4os.r4sys.Context, inventory: *const r4os.app_services.Inventory) bool {
+    var cursor: r4os.abi.ServiceInventoryCursor = .{
+        .revision = inventory.revision,
+        .total = inventory.rows.len,
+        .after_id = if (inventory.rows.len == 0) 0 else inventory.rows[inventory.rows.len - 1].registration_id,
+        .flags = r4os.abi.service_inventory_dynamic | r4os.abi.service_inventory_end,
+    };
+    var row: [1]r4os.abi.ServiceInventoryRow = undefined;
+    return sys.serviceInventoryPage(&cursor, &row) == 0 and cursor.flags & r4os.abi.service_inventory_end != 0;
 }
 
 fn parseConfig(sys: *r4os.r4sys.Context, data_raw: []const u8, report: *ConfigReport, dry_run: bool) void {
@@ -420,6 +561,7 @@ fn parseConfig(sys: *r4os.r4sys.Context, data_raw: []const u8, report: *ConfigRe
         var line = data[line_start..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         parseConfigLine(sys, line, report, dry_run);
+        if (report.error_code != 0) break;
         if (line_end >= data.len) break;
         line_start = line_end + 1;
     }
@@ -435,7 +577,7 @@ fn parseConfigLine(sys: *r4os.r4sys.Context, line_raw: []const u8, report: *Conf
     }
 
     var name_buf: [r4os.abi.service_name_bytes + 1]u8 = .{0} ** (r4os.abi.service_name_bytes + 1);
-    var path_buf: [r4os.abi.service_path_bytes + 1]u8 = .{0} ** (r4os.abi.service_path_bytes + 1);
+    var path_buf: [service_path_capacity]u8 = .{0} ** service_path_capacity;
     var args_buf: [r4os.abi.service_args_bytes + 1]u8 = .{0} ** (r4os.abi.service_args_bytes + 1);
     var desc_buf: [r4os.abi.service_description_bytes + 1]u8 = .{0} ** (r4os.abi.service_description_bytes + 1);
     var mode: u32 = r4os.abi.service_start_manual;
@@ -509,16 +651,16 @@ fn parseConfigLine(sys: *r4os.r4sys.Context, line_raw: []const u8, report: *Conf
         report.loaded += 1;
     } else if (rc == r4os.abi.service_api_result_duplicate) {
         report.duplicate += 1;
-    } else if (rc == r4os.abi.service_api_result_full) {
-        report.too_large = true;
+    } else if (rc == r4os.abi.service_api_result_full or rc == r4os.abi.service_api_result_memory or rc == r4os.abi.service_api_result_exhausted) {
+        report.error_code = rc;
     } else {
         report.invalid += 1;
     }
 }
 
-fn readDetails(sys: *r4os.r4sys.Context, staging: []r4os.abi.ServiceDetail) ?usize {
-    return switch (r4os.app_services.readCompleteDetails(sys, staging)) {
-        .complete => |count| count,
+fn readInventory(sys: *r4os.r4sys.Context) ?r4os.app_services.Inventory {
+    return switch (r4os.app_services.readInventory(sys, sys.allocator())) {
+        .complete => |inventory| inventory,
         .failure => |rc| {
             sys.write("SERVMAN: service enumeration failed: ");
             sys.println(resultName(rc));
@@ -527,34 +669,63 @@ fn readDetails(sys: *r4os.r4sys.Context, staging: []r4os.abi.ServiceDetail) ?usi
     };
 }
 
-fn writeConfig(sys: *r4os.r4sys.Context, out: []u8) ?usize {
-    var pos: usize = 0;
-    if (!append(out, &pos, "\xEF\xBB\xBF# R4OS SERVICES.R4S\r\n")) return null;
-    if (!append(out, &pos, "# Managed by SERVMAN.R4X\r\n")) return null;
-    var staging: [16]r4os.abi.ServiceDetail = undefined;
-    const count = readDetails(sys, &staging) orelse return null;
-    for (staging[0..count]) |detail| {
-        if (!append(out, &pos, "SERVICE;name=")) return null;
-        if (!append(out, &pos, spanZ(detail.info.name[0..]))) return null;
-        if (!append(out, &pos, ";path=")) return null;
-        if (!append(out, &pos, spanZ(detail.path[0..]))) return null;
+fn findRow(rows: []const r4os.abi.ServiceInventoryRow, name: []const u8) ?*const r4os.abi.ServiceInventoryRow {
+    for (rows) |*row| if (std.ascii.eqlIgnoreCase(spanZ(&row.info.name), name)) return row;
+    return null;
+}
+
+fn controlRow(sys: *r4os.r4sys.Context, row: *const r4os.abi.ServiceInventoryRow, action: Action) i32 {
+    var request: r4os.abi.ServiceControlRequest = .{
+        .registration_id = row.registration_id,
+        .start_generation = row.start_generation,
+        .process = row.process,
+    };
+    switch (action) {
+        .start => request.operation = r4os.abi.service_control_start,
+        .stop => {
+            request.operation = r4os.abi.service_control_stop;
+            request.timeout_ticks = 40;
+        },
+        .restart => request.operation = r4os.abi.service_control_restart,
+        .manual, .auto, .disable => {
+            request.operation = r4os.abi.service_control_mode;
+            request.mode = switch (action) {
+                .manual => r4os.abi.service_start_manual,
+                .auto => r4os.abi.service_start_auto,
+                else => r4os.abi.service_start_disabled,
+            };
+        },
+        .remove => request.operation = r4os.abi.service_control_remove,
+    }
+    return sys.serviceControlBound(&request);
+}
+
+fn renderConfig(allocator: std.mem.Allocator, rows: []const r4os.abi.ServiceInventoryRow) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "\xEF\xBB\xBF# R4OS SERVICES.R4S\r\n# Managed by SERVMAN.R4X\r\n");
+    for (rows) |detail| {
+        try out.appendSlice(allocator, "SERVICE;name=");
+        try out.appendSlice(allocator, spanZ(&detail.info.name));
+        try out.appendSlice(allocator, ";path=");
+        try out.appendSlice(allocator, spanZ(&detail.path));
         const args = spanZ(detail.args[0..]);
         if (args.len > 0) {
-            if (!append(out, &pos, ";args=")) return null;
-            if (!append(out, &pos, args)) return null;
+            try out.appendSlice(allocator, ";args=");
+            try out.appendSlice(allocator, args);
         }
-        if (!append(out, &pos, ";start=")) return null;
-        if (!append(out, &pos, serviceStartName(detail.info.start_mode))) return null;
-        if (!append(out, &pos, ";enabled=")) return null;
-        if (!append(out, &pos, if (detail.info.start_mode == r4os.abi.service_start_disabled) "no" else "yes")) return null;
+        try out.appendSlice(allocator, ";start=");
+        try out.appendSlice(allocator, serviceStartName(detail.info.start_mode));
+        try out.appendSlice(allocator, ";enabled=");
+        try out.appendSlice(allocator, if (detail.info.start_mode == r4os.abi.service_start_disabled) "no" else "yes");
         const desc = spanZ(detail.description[0..]);
         if (desc.len > 0) {
-            if (!append(out, &pos, ";description=")) return null;
-            if (!append(out, &pos, desc)) return null;
+            try out.appendSlice(allocator, ";description=");
+            try out.appendSlice(allocator, desc);
         }
-        if (!append(out, &pos, "\r\n")) return null;
+        try out.appendSlice(allocator, "\r\n");
     }
-    return pos;
+    return out.toOwnedSlice(allocator);
 }
 
 fn printConfigReport(sys: *r4os.r4sys.Context, label: []const u8, report: *const ConfigReport) void {
@@ -569,7 +740,10 @@ fn printConfigReport(sys: *r4os.r4sys.Context, label: []const u8, report: *const
     sys.write(" invalid=");
     writeUnsigned(sys, report.invalid);
     if (report.missing) sys.write(" missing=yes");
-    if (report.too_large) sys.write(" too-large=yes");
+    if (report.error_code != 0) {
+        sys.write(" error=");
+        sys.write(resultName(report.error_code));
+    }
     sys.println("");
 }
 
@@ -577,15 +751,14 @@ fn startAutoServices(sys: *r4os.r4sys.Context) i32 {
     var attempted: u32 = 0;
     var started: u32 = 0;
     var failed: u32 = 0;
-    var staging: [16]r4os.abi.ServiceDetail = undefined;
-    const total = readDetails(sys, &staging) orelse return 1;
-    for (staging[0..total]) |detail| {
+    var inventory = readInventory(sys) orelse return 1;
+    defer inventory.deinit();
+    for (inventory.rows) |*detail| {
         if (detail.info.start_mode != r4os.abi.service_start_auto) continue;
 
         attempted += 1;
-        var info: r4os.abi.ServiceInfo = .{};
         const name = spanZ(detail.info.name[0..]);
-        const start_rc = sys.serviceStart(@ptrCast(detail.info.name[0..].ptr), &info);
+        const start_rc = controlRow(sys, detail, .start);
         if (start_rc == r4os.abi.service_api_result_ok) {
             started += 1;
         } else {
@@ -605,15 +778,15 @@ fn startAutoServices(sys: *r4os.r4sys.Context) i32 {
 }
 
 fn printList(sys: *r4os.r4sys.Context) i32 {
-    var staging: [16]r4os.abi.ServiceDetail = undefined;
-    const count = readDetails(sys, &staging) orelse return 1;
+    var inventory = readInventory(sys) orelse return 1;
+    defer inventory.deinit();
     sys.println("SERVMAN Services");
-    for (staging[0..count]) |*detail| printServiceLine(sys, detail);
-    if (count == 0) sys.println("  No registered services.");
+    for (inventory.rows) |*detail| printServiceLine(sys, detail);
+    if (inventory.rows.len == 0) sys.println("  No registered services.");
     return 0;
 }
 
-fn printServiceLine(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDetail) void {
+fn printServiceLine(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceInventoryRow) void {
     sys.write("  ");
     sys.write(spanZ(detail.info.name[0..]));
     sys.write(" state=");
@@ -633,7 +806,7 @@ fn printServiceLine(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDet
     sys.println("");
 }
 
-fn printServiceDetail(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceDetail, process: *const r4os.abi.ProgramProcessHandle) void {
+fn printServiceDetail(sys: *r4os.r4sys.Context, detail: *const r4os.abi.ServiceInventoryRow, process: *const r4os.abi.ProgramProcessHandle) void {
     sys.write("Name: ");
     sys.println(spanZ(detail.info.name[0..]));
     sys.write("Status: ");
@@ -819,6 +992,9 @@ fn serviceStartName(raw: u32) []const u8 {
 fn resultName(rc: i32) []const u8 {
     return switch (rc) {
         r4os.abi.service_api_result_ok => "OK",
+        r4os.abi.service_api_result_memory => "out-of-memory",
+        r4os.abi.service_api_result_exhausted => "identity-exhausted",
+        r4os.abi.service_api_result_restart => "inventory-changed",
         r4os.abi.service_api_result_invalid => "invalid",
         r4os.abi.service_api_result_not_found => "not-found",
         r4os.abi.service_api_result_not_running => "not-running",
