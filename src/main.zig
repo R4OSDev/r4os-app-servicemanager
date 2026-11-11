@@ -8,10 +8,9 @@ const endpoint_status_op: u16 = 1;
 const endpoint_status_timeout_ms: u64 = 5000;
 const endpoint_status_attempts: u32 = 3;
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    var sys = r4_app.system();
-    const args = trim(zSlice(sys.argsRaw()));
-    return run(&sys, args);
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    var sys = app.system();
+    return run(&sys, trim(app.args()));
 }
 
 const Token = struct {
@@ -48,9 +47,7 @@ fn run(sys: *r4os.r4sys.Context, args: []const u8) i32 {
         return printList(sys);
     }
 
-    const first = takeToken(args) orelse {
-        return printList(sys);
-    };
+    const first = takeToken(args) orelse return fail(sys, "invalid-arguments");
 
     if (tokenEquals(first.token, "/?") or tokenEquals(first.token, "HELP")) {
         printUsage(sys);
@@ -287,7 +284,7 @@ fn commandStatus(sys: *r4os.r4sys.Context, rest: []const u8) i32 {
         return 1;
     };
     printServiceDetail(sys, detail, &detail.process);
-    printEndpointStatus(sys, name_ptr);
+    printEndpointStatus(sys, name_ptr, detail.process);
     return 0;
 }
 
@@ -431,6 +428,21 @@ fn saveConfig(sys: *r4os.r4sys.Context, verbose: bool) bool {
         sys.println("SERVMAN SAVE: original configuration could not be verified.");
         return false;
     };
+    if (old.exists and old.size == bytes.len and old.checksum == checks.checksum(bytes)) {
+        const current = readFileBytes(sys, config_path) catch {
+            sys.println("SERVMAN SAVE: original configuration could not be verified.");
+            return false;
+        };
+        defer sys.allocator().free(current);
+        if (std.mem.eql(u8, current, bytes)) {
+            if (!inventoryCurrent(sys, &inventory)) {
+                sys.println("SERVMAN SAVE: changed inventory; configuration not written.");
+                return false;
+            }
+            if (verbose) sys.println("SERVMAN SAVE: configuration already current.");
+            return true;
+        }
+    }
     var stage_buffer: [64]u8 = undefined;
     var backup_buffer: [64]u8 = undefined;
     const seed: u32 = @truncate(sys.ticks() ^ @intFromPtr(&stage_buffer));
@@ -439,11 +451,12 @@ fn saveConfig(sys: *r4os.r4sys.Context, verbose: bool) bool {
         const id = (seed +% @as(u32, @intCast(attempt))) & 0xFFFFFF;
         const stage = std.fmt.bufPrintZ(&stage_buffer, "C:\\R4OS\\CONFIG\\SM{X:0>6}.TMP", .{id}) catch return false;
         const backup = std.fmt.bufPrintZ(&backup_buffer, "C:\\R4OS\\CONFIG\\SM{X:0>6}.BAK", .{id}) catch return false;
-        var info: r4os.abi.FileInfo = .{};
-        const backup_rc = sys.fileInfoRaw(backup, &info);
-        if (backup_rc > 0) continue;
-        if (backup_rc < 0) return false;
-        var writer = switch (files.streamWriter(.{ .ptr = stage, .len = @intCast(stage.len) }, r4os.abi.file_stream_open_create)) {
+        switch (files.metadata(configPath(backup))) {
+            .found => continue,
+            .missing => {},
+            .failure => return false,
+        }
+        var writer = switch (files.streamWriter(configPath(stage), r4os.abi.file_stream_open_create)) {
             .writer => |value| value,
             .failure => |code| {
                 if (code == r4os.abi.file_stream_error_exists) continue;
@@ -502,43 +515,66 @@ fn saveConfig(sys: *r4os.r4sys.Context, verbose: bool) bool {
     return false;
 }
 
+fn configPath(path: [*:0]const u8) r4os.path.PathZ {
+    return .{ .ptr = path, .len = @intCast(std.mem.len(path)) };
+}
+
+fn matchesMetadata(files: *const r4os.app_storage.Files, path: r4os.path.PathZ, before: r4os.abi.FileMetadata2) bool {
+    const after = switch (files.metadata(path)) {
+        .found => |value| value,
+        .missing, .failure => return false,
+    };
+    return after.flags & r4os.abi.file_metadata2_flag_byte_size_valid != 0 and
+        before.byte_size == after.byte_size and before.content_revision == after.content_revision and
+        std.meta.eql(before.identity, after.identity);
+}
+
 fn readFileBytes(sys: *r4os.r4sys.Context, path: [*:0]const u8) ![]u8 {
-    var info: r4os.abi.FileInfo = .{};
-    const exists = sys.fileInfoRaw(path, &info);
-    if (exists == 0) return error.NotFound;
-    if (exists < 0) return error.Read;
+    const files: r4os.app_storage.Files = .{ .sys = sys.* };
+    const file = configPath(path);
+    const metadata = switch (files.metadata(file)) {
+        .found => |value| value,
+        .missing => return error.NotFound,
+        .failure => return error.Read,
+    };
+    if (metadata.flags & r4os.abi.file_metadata2_flag_byte_size_valid == 0) return error.Read;
+    const allocator = sys.allocator();
     var bytes: std.ArrayList(u8) = .empty;
-    errdefer bytes.deinit(sys.allocator());
+    errdefer bytes.deinit(allocator);
+    var reader = files.streamReader(file);
     var block: [16384]u8 = undefined;
-    while (true) {
-        const offset = std.math.cast(u32, bytes.items.len) orelse return error.OffsetRange;
-        const raw = sys.fileReadAt(path, offset, &block);
-        if (raw < 0 or raw > block.len) return error.Read;
-        if (raw == 0) break;
-        try bytes.appendSlice(sys.allocator(), block[0..@intCast(raw)]);
-    }
-    if (bytes.items.len != info.size) return error.Changed;
-    var current: r4os.abi.FileInfo = .{};
-    if (sys.fileInfoRaw(path, &current) <= 0 or current.size != info.size) return error.Changed;
-    return bytes.toOwnedSlice(sys.allocator());
+    while (true) switch (reader.read(&block)) {
+        .bytes => |count| try bytes.appendSlice(allocator, block[0..count]),
+        .end => break,
+        .failure => return error.Read,
+    };
+    if (bytes.items.len != metadata.byte_size or !matchesMetadata(&files, file, metadata)) return error.Changed;
+    return bytes.toOwnedSlice(allocator);
 }
 
 const Fingerprint = struct { exists: bool = false, size: u64 = 0, checksum: u32 = checks.checksum(&.{}) };
 fn fingerprint(sys: *r4os.r4sys.Context, path: [*:0]const u8) !Fingerprint {
-    var info: r4os.abi.FileInfo = .{};
-    const exists = sys.fileInfoRaw(path, &info);
-    if (exists < 0) return error.Read;
-    if (exists == 0) return .{};
+    const files: r4os.app_storage.Files = .{ .sys = sys.* };
+    const file = configPath(path);
+    const metadata = switch (files.metadata(file)) {
+        .found => |value| value,
+        .missing => return .{},
+        .failure => return error.Read,
+    };
+    if (metadata.flags & r4os.abi.file_metadata2_flag_byte_size_valid == 0) return error.Read;
     var result: Fingerprint = .{ .exists = true };
+    var reader = files.streamReader(file);
     var block: [16384]u8 = undefined;
-    while (true) {
-        const offset = std.math.cast(u32, result.size) orelse return error.OffsetRange;
-        const raw = sys.fileReadAt(path, offset, &block);
-        if (raw < 0 or raw > block.len) return error.Read;
-        if (raw == 0) return result;
-        result.checksum = checks.checksumUpdate(result.checksum, block[0..@intCast(raw)]);
-        result.size += @intCast(raw);
-    }
+    while (true) switch (reader.read(&block)) {
+        .bytes => |count| {
+            result.checksum = checks.checksumUpdate(result.checksum, block[0..count]);
+            result.size += count;
+        },
+        .end => break,
+        .failure => return error.Read,
+    };
+    if (result.size != metadata.byte_size or !matchesMetadata(&files, file, metadata)) return error.Changed;
+    return result;
 }
 
 fn inventoryCurrent(sys: *r4os.r4sys.Context, inventory: *const r4os.app_services.Inventory) bool {
@@ -675,29 +711,18 @@ fn findRow(rows: []const r4os.abi.ServiceInventoryRow, name: []const u8) ?*const
 }
 
 fn controlRow(sys: *r4os.r4sys.Context, row: *const r4os.abi.ServiceInventoryRow, action: Action) i32 {
-    var request: r4os.abi.ServiceControlRequest = .{
-        .registration_id = row.registration_id,
-        .start_generation = row.start_generation,
-        .process = row.process,
+    const command: r4os.app_services.InventoryAction = switch (action) {
+        .start => .start,
+        .stop => .{ .stop = r4os.time_contract.timeoutFinite(
+            r4os.time_contract.durationFromTicks(40, sys.monotonicHz()) catch return r4os.abi.service_api_result_invalid,
+        ) },
+        .restart => .restart,
+        .manual => .{ .mode = r4os.abi.service_start_manual },
+        .auto => .{ .mode = r4os.abi.service_start_auto },
+        .disable => .{ .mode = r4os.abi.service_start_disabled },
+        .remove => .remove,
     };
-    switch (action) {
-        .start => request.operation = r4os.abi.service_control_start,
-        .stop => {
-            request.operation = r4os.abi.service_control_stop;
-            request.timeout_ticks = 40;
-        },
-        .restart => request.operation = r4os.abi.service_control_restart,
-        .manual, .auto, .disable => {
-            request.operation = r4os.abi.service_control_mode;
-            request.mode = switch (action) {
-                .manual => r4os.abi.service_start_manual,
-                .auto => r4os.abi.service_start_auto,
-                else => r4os.abi.service_start_disabled,
-            };
-        },
-        .remove => request.operation = r4os.abi.service_control_remove,
-    }
-    return sys.serviceControlBound(&request);
+    return r4os.app_services.controlEntry(sys, row, command);
 }
 
 fn renderConfig(allocator: std.mem.Allocator, rows: []const r4os.abi.ServiceInventoryRow) ![]u8 {
@@ -882,25 +907,37 @@ fn memoryProfileName(profile: u8) []const u8 {
     };
 }
 
-fn printEndpointStatus(sys: *r4os.r4sys.Context, name: [*:0]const u8) void {
-    var info: r4os.abi.ServiceInfo = .{};
-    const open_rc = sys.serviceOpen(name, &info);
-    if (open_rc != r4os.abi.service_api_result_ok or info.handle == 0) return;
-    defer _ = sys.serviceClose(info.handle);
+fn printEndpointStatus(sys: *r4os.r4sys.Context, name: [*:0]const u8, process: r4os.abi.ProgramProcessHandle) void {
+    if (process.generation == 0) return;
+    const services: r4os.Services = .{ .sys = sys.* };
+    var connection = switch (services.open(name)) {
+        .connection => |value| value,
+        .failure => return,
+    };
+    defer _ = connection.close();
+    var detail: r4os.abi.ServiceDetail = .{};
+    var current: r4os.abi.ProgramProcessHandle = .{};
+    if (connection.info.instance_id != process.instance_id or
+        sys.serviceBoundDetail(name, &detail, &current) != 0 or !std.meta.eql(process, current)) return;
 
-    var header: r4os.abi.ServiceMessageHeader = .{};
+    const timeout = r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(endpoint_status_timeout_ms * 1_000_000));
+    var budget = connection.budget(timeout) catch return;
     var response: [r4os.abi.service_api_max_payload]u8 = undefined;
-    var got: i32 = 0;
-    var attempt: u32 = 0;
-    while (attempt < endpoint_status_attempts) : (attempt += 1) {
-        header = .{};
-        got = sys.serviceCall(info.handle, endpoint_status_op, "STATUS", &header, response[0..], sys.ticksFromMilliseconds(endpoint_status_timeout_ms));
-        if (got > 0 and header.status == r4os.abi.service_api_result_ok) break;
-        sys.sleepTicks(sys.ticksFromMilliseconds(50));
+    var len: usize = 0;
+    for (0..endpoint_status_attempts) |attempt| {
+        switch (connection.callBudget(endpoint_status_op, "STATUS", &response, &budget)) {
+            .response => |value| {
+                len = value.bytes;
+                break;
+            },
+            .failure, .remote_failure => |raw| if (raw != r4os.abi.service_api_result_busy) return,
+            .timed_out => return,
+        }
+        if (attempt + 1 == endpoint_status_attempts) return;
+        const remaining = budget.remainingTicks() catch return;
+        sys.sleepTicks(@min(remaining, sys.ticksFromMilliseconds(50)));
     }
-    if (got <= 0 or header.status != r4os.abi.service_api_result_ok) return;
-    const len: usize = @intCast(got);
-    if (!isPrintableEndpointStatus(response[0..len])) return;
+    if (len == 0 or !isPrintableEndpointStatus(response[0..len])) return;
     sys.write("Endpoint: ");
     sys.write(response[0..len]);
     sys.println("");
@@ -977,7 +1014,8 @@ fn serviceStateName(raw: u32) []const u8 {
         r4os.abi.service_state_stopping => "stopping",
         r4os.abi.service_state_failed => "failed",
         r4os.abi.service_state_disabled => "disabled",
-        else => "empty",
+        r4os.abi.service_state_empty => "empty",
+        else => "unknown",
     };
 }
 
@@ -1054,10 +1092,10 @@ fn writeUnsigned(sys: *r4os.r4sys.Context, value: u64) void {
 
 fn takeToken(s_raw: []const u8) ?Token {
     const s = trim(s_raw);
-    if (s.len == 0) return null;
-    var end: usize = 0;
-    while (end < s.len and s[end] != ' ' and s[end] != '\t') : (end += 1) {}
-    return .{ .token = s[0..end], .rest = trim(s[end..]) };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(s, .{ .quotes = @intFromEnum(r4os.arguments.Quotes.none) }, &failure) catch return null;
+    const item = (cursor.next() catch return null) orelse return null;
+    return .{ .token = item.bytes(s) catch return null, .rest = trim(cursor.remainingRaw() catch return null) };
 }
 
 fn trim(s: []const u8) []const u8 {

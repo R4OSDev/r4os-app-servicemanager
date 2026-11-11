@@ -45,3 +45,16 @@ Dienstsnapshot aus service_bound_detail. Dienstinformationen und voller
 Prozesshandle gehoeren damit zu derselben Generation; die Memoryabfrage
 verwendet genau diesen Handle. Die bisherige Suche im gesamten
 Prozessinventar nach einer blossen Instanz-ID entfaellt.
+
+API-Migration 0.90.64
+---------------------
+SERVMAN 0.1.7 verwendet Start2 und R4SYS Query2. Der gemeinsame
+Argumentcursor erhaelt die vorhandenen Befehle. Inventar und Aenderungen
+binden Registrierung, Startgeneration und Prozess. Endpoint-Status wird
+ueber einen gebundenen Kanal innerhalb eines gemeinsamen Fuenfsekunden-
+Budgets abgefragt. Dateiidentitaet, Inhaltrevision und Laenge werden
+vor und nach dem Lesen geprueft. Die atomare Speicheroperation prueft
+weiterhin den vorhandenen Konfigurationsinhalt und die Inventarrevision.
+Bei gleichem Fingerprint wird die vorhandene Datei vollstaendig und
+bytegenau mit dem Zielinhalt verglichen. Stabile Metadaten und die aktuelle
+Inventarrevision bestaetigen einen bereits gespeicherten Zustand.
